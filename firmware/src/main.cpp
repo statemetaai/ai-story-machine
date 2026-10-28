@@ -1,21 +1,29 @@
-// 亲子 AI 故事机 · ESP32-S3 固件骨架 v0.1
+// 亲子 AI 故事机 · ESP32-S3 固件 v0.2
 // 引脚配置见下表，不做改动。
 //   麦克风 INMP441 (I2S0 收): WS=GPIO4, SCK=GPIO5, SD=GPIO6, L/R=GND(左声道)
 //   功放 MAX98357A (I2S1 发): DIN=GPIO7, BCLK=GPIO15, LRC=GPIO16, SD=Vin常开, GAIN=GND
 //   屏幕 SPI-LCD (ST7789): SCL=GPIO21, SDA=GPIO47, RES=GPIO45, DC=GPIO40, CS=GPIO41, BLK=GPIO42
-//   按钮: 板载 BOOT = GPIO0（短按 = 下一个故事）
+//   按钮: 板载 BOOT = GPIO0（短按 = 下一个本地故事；长按 1 秒 = 语音输入）
 //
 // 注意 GPIO45: 它是启动配置脚，管 Flash 电压。启动瞬间必须是低电平。
 // 本固件在 setup() 里、启动完成之后才操作 RES 脚，启动前不碰它。
 // 本硬件按此接法实测可启动，按此配置执行。
 //
-// 阶段: H1 点亮屏幕 / H2 功放出声 / H3 麦克风回放(串口看电平) / H4 本地故事
-// H5 联网 AI (录音 -> AI 生成 -> TTS -> 播放) 是下一版，见 README。
+// 阶段: H1 点亮屏幕 / H2 功放出声 / H3 麦克风 / H4 本地故事
+//       H5 TTS/STT 可配置（见 include/config.h，默认关闭，配置后启用）
+// TTS/STT 均可配置：提供商、语音、语速、采样率、VAD 阈值等见 config.h。
+// 未配置提供商时，设备只用本地模板故事和提示音，不联网、不上传录音。
 
 #include <Arduino.h>
 #include <driver/i2s.h>
 #include <LovyanGFX.hpp>
 #include <math.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+#include "config.h"
+#include "secrets.h"
 
 // ---------- LCD (LovyanGFX, ST7789) ----------
 class LGFX : public lgfx::LGFX_Device {
@@ -160,6 +168,150 @@ static void playTone(int freqHz, int ms) {
 }
 static void playChime() { playTone(523, 120); playTone(659, 120); playTone(784, 200); }
 
+// ---------- WiFi / TTS / STT / LLM（H5，可配置，默认关闭） ----------
+// 原则：未在 config.h 中启用提供商时，不连接 WiFi、不上传录音、不调用任何云端 API。
+// 启用后：录音 -> STT 转文字 -> LLM 生成故事 -> TTS 合成语音 -> I2S 播放。
+// 任一步失败，自动回落到本地模板故事 + 提示音，并在串口和屏幕上说明原因。
+static bool wifiConnected = false;
+
+static bool connectWiFi() {
+  if (STT_PROVIDER == STT_NONE && TTS_PROVIDER == TTS_NONE && LLM_PROVIDER == LLM_NONE) return false;
+  if (String(WIFI_SSID).length() == 0) { Serial.println("[WiFi] 未配置 WIFI_SSID，跳过联网"); return false; }
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_TIMEOUT_MS) delay(200);
+  wifiConnected = (WiFi.status() == WL_CONNECTED);
+  Serial.printf("[WiFi] %s\n", wifiConnected ? "已连接" : "连接失败");
+  return wifiConnected;
+}
+
+// 给 16-bit PCM 加 44 字节 WAV 头，STT 接口需要 WAV 格式
+static size_t wavHeader(uint8_t* out, size_t pcmBytes) {
+  uint32_t total = pcmBytes + 36;
+  memcpy(out, "RIFF", 4);
+  memcpy(out + 4, &total, 4);
+  memcpy(out + 8, "WAVEfmt ", 8);
+  uint32_t v = 16; memcpy(out + 16, &v, 4);
+  uint16_t t = 1; memcpy(out + 20, &t, 2);
+  t = 1; memcpy(out + 22, &t, 2);
+  uint32_t sr = AUDIO_SAMPLE_RATE; memcpy(out + 24, &sr, 4);
+  uint32_t br = AUDIO_SAMPLE_RATE * 2; memcpy(out + 28, &br, 4);
+  uint16_t ba = 2; memcpy(out + 32, &ba, 2);
+  uint16_t bits = 16; memcpy(out + 34, &bits, 2);
+  memcpy(out + 36, "data", 4);
+  memcpy(out + 40, &pcmBytes, 4);
+  return 44;
+}
+
+// STT：把录音发给配置的提供商，返回识别出的文字；失败返回 false
+static bool transcribeAudio(const int16_t* samples, size_t count, String& outText) {
+  if (STT_PROVIDER == STT_NONE || !wifiConnected) return false;
+  if (STT_PROVIDER == STT_OPENAI_WHISPER) {
+    size_t pcmBytes = count * 2;
+    size_t wavBytes = pcmBytes + 44;
+    uint8_t* wav = (uint8_t*)ps_malloc(wavBytes);
+    if (!wav) return false;
+    wavHeader(wav, pcmBytes);
+    memcpy(wav + 44, samples, pcmBytes);
+    WiFiClientSecure client; client.setInsecure();
+    HTTPClient http; http.setTimeout(HTTP_TIMEOUT_MS);
+    http.begin(client, String(OPENAI_API_BASE) + "/audio/transcriptions");
+    http.addHeader("Authorization", String("Bearer ") + OPENAI_API_KEY);
+    String boundary = "----StoryMachineBoundary";
+    http.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+    String head = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n" + STT_OPENAI_MODEL +
+      "\r\n--" + boundary + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"speech.wav\"\r\nContent-Type: audio/wav\r\n\r\n";
+    String tail = "\r\n--" + boundary + "--\r\n";
+    size_t bodyLen = head.length() + wavBytes + tail.length();
+    uint8_t* body = (uint8_t*)ps_malloc(bodyLen);
+    if (!body) { free(wav); return false; }
+    memcpy(body, head.c_str(), head.length());
+    memcpy(body + head.length(), wav, wavBytes);
+    memcpy(body + head.length() + wavBytes, tail.c_str(), tail.length());
+    int code = http.POST(body, bodyLen);
+    bool ok = false;
+    if (code == 200) {
+      JsonDocument doc; deserializeJson(doc, http.getString());
+      if (doc["text"].is<const char*>()) { outText = doc["text"].as<String>(); ok = outText.length() > 0; }
+    } else { Serial.printf("[STT] HTTP %d\n", code); }
+    free(body); free(wav); http.end();
+    return ok;
+  }
+  Serial.println("[STT] 该提供商暂未实现，请在 config.h 中选择 STT_OPENAI_WHISPER 或 STT_NONE");
+  return false;
+}
+
+// TTS：把文字合成为 WAV PCM 并直接经 I2S 播放；失败返回 false
+static bool speakText(const String& text) {
+  if (TTS_PROVIDER == TTS_NONE || !wifiConnected) { playChime(); return false; }
+  if (TTS_PROVIDER == TTS_OPENAI) {
+    WiFiClientSecure client; client.setInsecure();
+    HTTPClient http; http.setTimeout(HTTP_TIMEOUT_MS);
+    http.begin(client, String(OPENAI_API_BASE) + "/audio/speech");
+    http.addHeader("Authorization", String("Bearer ") + OPENAI_API_KEY);
+    http.addHeader("Content-Type", "application/json");
+    JsonDocument req;
+    req["model"] = TTS_OPENAI_MODEL; req["input"] = text;
+    req["voice"] = TTS_VOICE; req["response_format"] = TTS_OPENAI_FORMAT; req["speed"] = TTS_SPEED;
+    String payload; serializeJson(req, payload);
+    int code = http.POST(payload);
+    if (code != 200) { Serial.printf("[TTS] HTTP %d\n", code); http.end(); return false; }
+    WiFiClient* stream = http.getStreamPtr();
+    uint8_t header[44]; size_t got = 0;
+    while (got < 44 && stream->available()) got += stream->readBytes(header + got, 44 - got);
+    uint8_t buf[512]; size_t written = 0;
+    while (http.connected()) {
+      int n = stream->readBytes(buf, sizeof(buf));
+      if (n <= 0) break;
+      i2s_write(I2S_NUM_1, buf, n, &written, portMAX_DELAY);
+    }
+    http.end(); return true;
+  }
+  Serial.println("[TTS] 该提供商暂未实现，请在 config.h 中选择 TTS_OPENAI 或 TTS_NONE");
+  return false;
+}
+
+// LLM：根据提示生成故事文本；失败返回 false，调用方回落到本地模板
+static bool generateStoryAI(const String& prompt, String& outStory) {
+  if (LLM_PROVIDER == LLM_NONE || !wifiConnected) return false;
+  WiFiClientSecure client; client.setInsecure();
+  HTTPClient http; http.setTimeout(HTTP_TIMEOUT_MS);
+  http.begin(client, String(OPENAI_API_BASE) + "/chat/completions");
+  http.addHeader("Authorization", String("Bearer ") + OPENAI_API_KEY);
+  http.addHeader("Content-Type", "application/json");
+  JsonDocument req;
+  req["model"] = LLM_OPENAI_MODEL; req["max_tokens"] = LLM_MAX_TOKENS; req["temperature"] = LLM_TEMPERATURE;
+  JsonArray msgs = req["messages"].to<JsonArray>();
+  JsonObject sys = msgs.add<JsonObject>(); sys["role"] = "system";
+  sys["content"] = "你是一位给 3-8 岁孩子讲睡前故事的讲故事人。用中文讲一个 150 字左右的温馨短故事，语言简单，有一个明确的小道理。";
+  JsonObject usr = msgs.add<JsonObject>(); usr["role"] = "user"; usr["content"] = prompt;
+  String payload; serializeJson(req, payload);
+  int code = http.POST(payload);
+  if (code != 200) { Serial.printf("[LLM] HTTP %d\n", code); http.end(); return false; }
+  JsonDocument doc; deserializeJson(doc, http.getString());
+  if (doc["choices"][0]["message"]["content"].is<const char*>()) {
+    outStory = doc["choices"][0]["message"]["content"].as<String>(); http.end(); return outStory.length() > 0;
+  }
+  http.end(); return false;
+}
+
+// 录音：按住按钮期间采集，静音 1.5 秒或满 8 秒停止；返回采样数
+static size_t recordAudio(int16_t* out, size_t maxCount) {
+  size_t count = 0;
+  unsigned long lastVoice = millis();
+  int32_t raw[256]; size_t readBytes = 0;
+  while (count < maxCount && millis() - lastVoice < SILENCE_TIMEOUT_MS) {
+    if (i2s_read(I2S_NUM_0, raw, sizeof(raw), &readBytes, 100 / portTICK_PERIOD_MS) != ESP_OK) continue;
+    int n = readBytes / 4;
+    for (int i = 0; i < n && count < maxCount; i++) {
+      int16_t s = (int16_t)(raw[i] >> 16); // 32-bit 槽取高 16 位
+      out[count++] = s;
+      if (abs(s) > VAD_THRESHOLD) lastVoice = millis();
+    }
+  }
+  return count;
+}
+
 // ---------- LCD 显示 ----------
 static void showStory(int idx) {
   const Story& s = STORIES[idx];
@@ -192,7 +344,8 @@ static void showStory(int idx) {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n[故事机] 启动，H1-H4 骨架 v0.1");
+  Serial.println("\n[故事机] 启动，H1-H5 v0.2");
+  Serial.printf("[配置] STT=%d TTS=%d LLM=%d 语言=%s\n", STT_PROVIDER, TTS_PROVIDER, LLM_PROVIDER, STORY_LANG);
 
   // 背光：先开
   pinMode(PIN_LCD_BLK, OUTPUT);
@@ -218,6 +371,9 @@ void setup() {
   Serial.println("[H2/H3] I2S OK: Mic I2S0, Spk I2S1, 16kHz");
 
   pinMode(PIN_BTN, INPUT_PULLUP);
+
+  // H5: 只有在 config.h 中启用了任一云端提供商时才联网；否则保持离线
+  connectWiFi();
 
   // H2: 提示音，确认功放出声
   playChime();
@@ -245,12 +401,45 @@ void loop() {
     }
   }
 
-  // 按钮：短按换故事（消抖）
+  // 按钮：短按（<800ms）= 下一个本地故事；长按（>=800ms）= 语音输入
+  // 长按流程：录音 -> STT -> LLM 生成故事 -> TTS 播放；任一步失败回落到本地故事
   static int lastBtn = HIGH;
-  static unsigned long lastPress = 0;
+  static unsigned long pressStart = 0;
+  static bool longPressHandled = false;
   int btn = digitalRead(PIN_BTN);
-  if (btn == LOW && lastBtn == HIGH && millis() - lastPress > 300) {
-    lastPress = millis();
+  if (btn == LOW && lastBtn == HIGH) { pressStart = millis(); longPressHandled = false; }
+  if (btn == LOW && !longPressHandled && millis() - pressStart >= 800) {
+    longPressHandled = true;
+    if (STT_PROVIDER == STT_NONE) {
+      Serial.println("[语音] STT 未启用（config.h 中 STT_PROVIDER=STT_NONE），长按无效");
+    } else {
+      Serial.println("[语音] 开始录音，松开按钮结束（最长 8 秒）");
+      size_t maxCount = AUDIO_SAMPLE_RATE * MAX_RECORD_SECONDS;
+      int16_t* samples = (int16_t*)ps_malloc(maxCount * sizeof(int16_t));
+      if (samples) {
+        size_t count = recordAudio(samples, maxCount);
+        Serial.printf("[语音] 录音 %u 个采样\n", (unsigned)count);
+        String heard;
+        if (count > 1000 && transcribeAudio(samples, count, heard)) {
+          Serial.printf("[STT] 听到：%s\n", heard.c_str());
+          String aiStory;
+          String prompt = "孩子说：" + heard + "。请根据这句话编一个睡前故事。";
+          if (generateStoryAI(prompt, aiStory)) {
+            Serial.println("[LLM] 已生成故事，正在用 TTS 播放");
+            if (!speakText(aiStory)) { showStory(storyIndex); }
+          } else {
+            Serial.println("[LLM] 生成失败，回落到本地故事");
+            showStory(storyIndex);
+          }
+        } else {
+          Serial.println("[STT] 识别失败，回落到本地故事");
+          showStory(storyIndex);
+        }
+        free(samples);
+      }
+    }
+  }
+  if (btn == HIGH && lastBtn == LOW && !longPressHandled && millis() - pressStart < 800 && millis() - pressStart > 50) {
     storyIndex = (storyIndex + 1) % STORY_COUNT;
     playChime();
     showStory(storyIndex);
