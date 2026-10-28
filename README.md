@@ -62,4 +62,4 @@ ai-story-machine/
 
 ---
 
-Made with ❤️ by Max & 小可爱 — 让 AI 走进物理世界，从一个睡前故事开始。
+AI Story Machine — 让 AI 走进物理世界，从一个睡前故事开始。
