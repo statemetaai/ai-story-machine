@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>亲子 AI 故事机 · AI Story Machine</title>
+<style>
+  :root{--bg:#fff7e8;--card:#fff;--ink:#3a2a1e;--muted:#8a7263;--line:#f0ddc8;--accent:#ff7a3d;--teal:#0e9a8b;--purple:#7c6ff0;--pink:#ff6b9d}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:"Noto Sans SC",system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+  .wrap{max-width:920px;margin:0 auto;padding:20px 16px 40px}
+  h1{font-size:32px;margin:6px 0 4px;font-weight:900}
+  h1 span{color:var(--accent)}
+  .sub{color:var(--muted);font-size:15px;line-height:1.7;margin:0 0 18px;max-width:640px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:20px;padding:18px;box-shadow:0 10px 30px rgba(58,42,30,.08);margin-bottom:16px}
+  .label{font-weight:800;font-size:14px;margin:0 0 8px}
+  .row{display:flex;gap:8px;flex-wrap:wrap}
+  .chip{border:2px solid var(--line);background:#fff;border-radius:999px;padding:10px 16px;font-size:15px;cursor:pointer;font-weight:700}
+  .chip.on{border-color:var(--accent);background:#fff0e6;color:#d94f00}
+  .chip.teal.on{border-color:var(--teal);background:#e6f7f4;color:#067a6e}
+  .chip.purple.on{border-color:var(--purple);background:#efedff;color:#4a3fd1}
+  input[type=text]{width:100%;max-width:320px;padding:12px 14px;border:2px solid var(--line);border-radius:12px;font-size:16px}
+  select{padding:12px;border:2px solid var(--line);border-radius:12px;font-size:15px;background:#fff}
+  .btn{border:0;border-radius:999px;padding:14px 22px;font-size:17px;font-weight:900;cursor:pointer}
+  .btn-primary{background:var(--accent);color:#fff;box-shadow:0 8px 20px rgba(255,122,61,.35)}
+  .btn-ghost{background:#fff;border:2px solid var(--line);color:var(--ink)}
+  .btn-teal{background:var(--teal);color:#fff}
+  .actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:6px}
+  #story{display:none}
+  #storyTitle{font-size:24px;margin:4px 0 10px}
+  #storyBody{font-size:17px;line-height:1.9;white-space:pre-wrap}
+  #storyBody p{margin:0 0 12px}
+  .meta{color:var(--muted);font-size:13px}
+  .fav{border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin-top:8px;background:#fffdf8}
+  .fav b{display:block;margin-bottom:4px}
+  .note{font-size:13px;color:var(--muted);line-height:1.6}
+  @media(max-width:600px){h1{font-size:26px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>📖 亲子 <span>AI 故事机</span></h1>
+  <p class="sub">先在网页上验证玩法：选一个主角、一个地方、一个小道理，点一下就能编一个新故事，还能读出来。以后这个玩法会搬到 ESP32-S3 硬件上，按按钮就能听故事。</p>
+
+  <div class="card">
+    <p class="label">👧👦 小朋友叫什么？</p>
+    <input type="text" id="kidName" placeholder="比如：乐乐" value="">
+    <select id="age" style="margin-left:6px">
+      <option value="3-5岁">3–5 岁</option>
+      <option value="6-8岁" selected>6–8 岁</option>
+      <option value="9岁以上">9 岁以上</option>
+    </select>
+  </div>
+
+  <div class="card">
+    <p class="label">🦸 主角是谁？</p>
+    <div class="row" id="heroes"></div>
+  </div>
+
+  <div class="card">
+    <p class="label">🌍 故事发生在哪里？</p>
+    <div class="row" id="scenes"></div>
+  </div>
+
+  <div class="card">
+    <p class="label">💛 今天想学到什么？</p>
+    <div class="row" id="lessons"></div>
+  </div>
+
+  <div class="actions">
+    <button class="btn btn-primary" id="genBtn">✨ 编一个新故事</button>
+    <button class="btn btn-ghost" id="randomBtn">🎲 随便来一个</button>
+  </div>
+
+  <div class="card" id="story">
+    <p class="meta" id="storyMeta"></p>
+    <h2 id="storyTitle"></h2>
+    <div id="storyBody"></div>
+    <div class="actions">
+      <button class="btn btn-teal" id="readBtn">🔊 读给我听</button>
+      <button class="btn btn-ghost" id="stopBtn">⏹ 停下来</button>
+      <button class="btn btn-ghost" id="favBtn">⭐ 收藏这个故事</button>
+      <button class="btn btn-ghost" id="againBtn">🔁 再编一个</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <p class="label">⭐ 收藏的故事</p>
+    <div id="favs"><p class="note">还没有收藏。听到喜欢的故事，点“收藏这个故事”，它就会留在这里。</p></div>
+  </div>
+
+  <p class="note">网页版说明：故事是本地模板组合生成的，不用联网、不用填 API Key，适合先验证玩法。硬件版（ESP32-S3）会在此基础上加按钮、喇叭和联网 AI 生成，见仓库 README 的路线图。</p>
+</div>
+
+<script>
+const HEROES = [
+  {id:'cat', emoji:'🐱', name:'小猫咪咪', trait:'好奇又爱干净'},
+  {id:'dino', emoji:'🦕', name:'小恐龙嘟嘟', trait:'力气大，心很软'},
+  {id:'astro', emoji:'🧑‍🚀', name:'小宇航员星星', trait:'胆大，爱问为什么'},
+  {id:'pelican', emoji:'🦤', name:'小鹈鹕皮皮', trait:'爱骑车，爱兜风'},
+  {id:'mouse', emoji:'🐭', name:'小老鼠吱吱', trait:'跑得快，点子多'},
+];
+const SCENES = [
+  {id:'forest', emoji:'🌲', name:'森林', desc:'大树、蘑菇和小溪'},
+  {id:'space', emoji:'🚀', name:'太空', desc:'星星、月亮和飞船'},
+  {id:'sea', emoji:'🌊', name:'海底', desc:'珊瑚、贝壳和小鱼'},
+  {id:'lake', emoji:'🦢', name:'湖边', desc:'湖水、芦苇和鸭子'},
+  {id:'town', emoji:'🌈', name:'彩虹小镇', desc:'彩色的房子和集市'},
+];
+const LESSONS = [
+  {id:'brave', name:'勇敢', text:'遇到害怕的事，先深呼吸，再勇敢地试一小步。'},
+  {id:'share', name:'分享', text:'好东西和朋友一起分享，快乐会变成两份。'},
+  {id:'curious', name:'好奇', text:'多问一个“为什么”，世界就会多打开一扇门。'},
+  {id:'persist', name:'坚持', text:'一次做不好没关系，再试一次，就离成功近一点。'},
+  {id:'friend', name:'友爱', text:'朋友遇到困难，伸出手帮忙，就是最棒的超能力。'},
+];
+
+let sel = {hero:'cat', scene:'lake', lesson:'brave'};
+let currentStory = null;
+
+function renderChips(elId, items, key, cls){
+  const el = document.getElementById(elId);
+  el.innerHTML = '';
+  items.forEach(it=>{
+    const b = document.createElement('button');
+    b.className = 'chip ' + (cls||'') + (sel[key]===it.id ? ' on' : '');
+    b.textContent = (it.emoji ? it.emoji+' ' : '') + it.name;
+    b.onclick = ()=>{ sel[key]=it.id; renderAll(); };
+    el.appendChild(b);
+  });
+}
+function renderAll(){
+  renderChips('heroes', HEROES, 'hero', '');
+  renderChips('scenes', SCENES, 'scene', 'teal');
+  renderChips('lessons', LESSONS, 'lesson', 'purple');
+}
+renderAll();
+
+function pick(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
+function kid(){ return (document.getElementById('kidName').value.trim() || '小朋友'); }
+
+function generate(){
+  const hero = HEROES.find(h=>h.id===sel.hero);
+  const scene = SCENES.find(s=>s.id===sel.scene);
+  const lesson = LESSONS.find(l=>l.id===sel.lesson);
+  const age = document.getElementById('age').value;
+  const name = kid();
+  const openings = [
+    `在一个阳光很好的早上，${hero.name}醒来了。它${hero.trait}，今天决定去${scene.name}玩一玩。`,
+    `${scene.name}真热闹，有${scene.desc}。${hero.name}背上小书包，对${name}说：“走，我们一起去冒险吧！”`,
+    `有一天，${hero.name}听说${scene.name}里藏着一个小秘密，于是它邀请${name}一起出发了。`,
+  ];
+  const middles = [
+    `走着走着，前面出现了一道难题。${hero.name}有点紧张，心里砰砰跳。它想起${name}说过的话，深吸一口气，决定先试一小步。没想到，试一试之后，办法真的出现了。`,
+    `路上，${hero.name}遇到了一个需要帮助的朋友。朋友的东西掉进了水里，${hero.name}没有走开，而是动脑筋想办法，还请${name}一起帮忙。两个人齐心协力，终于把东西捞了上来。`,
+    `忽然，天空飘来一片乌云。${hero.name}没有跑回家，而是打开小伞，和${name}一起数雨滴、听雨声。等雨停了，${scene.name}变得更干净、更漂亮了。`,
+  ];
+  const endings = [
+    `回到家的时候，${hero.name}开心地说：“原来${lesson.text}”${name}笑着点点头，把今天的故事记在了心里。`,
+    `晚上，${hero.name}躺在床上想：今天我学会了${lesson.name}。${lesson.text}它抱着这个小道理，甜甜地睡着了。`,
+    `从那以后，每次去${scene.name}，${hero.name}都会想起今天和${name}一起的冒险。它明白了：${lesson.text}`,
+  ];
+  const title = `${hero.name}的${scene.name}冒险`;
+  const body = pick(openings) + '\n\n' + pick(middles) + '\n\n' + pick(endings);
+  currentStory = {title, body, hero:hero.name, scene:scene.name, lesson:lesson.name, age};
+  document.getElementById('story').style.display = 'block';
+  document.getElementById('storyMeta').textContent = `${hero.emoji} ${hero.name} · ${scene.emoji} ${scene.name} · 💛 ${lesson.name} · 适合${age}`;
+  document.getElementById('storyTitle').textContent = title;
+  document.getElementById('storyBody').innerHTML = body.split('\n\n').map(p=>`<p>${p}</p>`).join('');
+  document.getElementById('story').scrollIntoView({behavior:'smooth'});
+  renderFavs();
+}
+
+function randomize(){
+  sel.hero = pick(HEROES).id; sel.scene = pick(SCENES).id; sel.lesson = pick(LESSONS).id;
+  renderAll(); generate();
+}
+function readAloud(){
+  if(!currentStory) return;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(currentStory.title + '。' + currentStory.body);
+  u.lang = 'zh-CN'; u.rate = 0.95; u.pitch = 1.1;
+  speechSynthesis.speak(u);
+}
+function getFavs(){ try{ return JSON.parse(localStorage.getItem('story_favs')||'[]'); }catch(e){ return []; } }
+function renderFavs(){
+  const list = getFavs();
+  const el = document.getElementById('favs');
+  if(!list.length){ el.innerHTML = '<p class="note">还没有收藏。听到喜欢的故事，点“收藏这个故事”，它就会留在这里。</p>'; return; }
+  el.innerHTML = '';
+  list.slice().reverse().forEach((s,i)=>{
+    const d = document.createElement('div'); d.className='fav';
+    d.innerHTML = `<b>${s.title}</b><span class="meta">${s.hero} · ${s.scene} · ${s.lesson}</span>`;
+    d.onclick = ()=>{ currentStory=s; document.getElementById('story').style.display='block'; document.getElementById('storyMeta').textContent=`${s.hero} · ${s.scene} · 💛 ${s.lesson}`; document.getElementById('storyTitle').textContent=s.title; document.getElementById('storyBody').innerHTML=s.body.split('\n\n').map(p=>`<p>${p}</p>`).join(''); };
+    el.appendChild(d);
+  });
+}
+renderFavs();
+
+document.getElementById('genBtn').onclick = generate;
+document.getElementById('randomBtn').onclick = randomize;
+document.getElementById('againBtn').onclick = generate;
+document.getElementById('readBtn').onclick = readAloud;
+document.getElementById('stopBtn').onclick = ()=>speechSynthesis.cancel();
+document.getElementById('favBtn').onclick = ()=>{
+  if(!currentStory) return;
+  const list = getFavs(); list.push(currentStory);
+  localStorage.setItem('story_favs', JSON.stringify(list));
+  renderFavs(); alert('已收藏 ⭐');
+};
+</script>
+</body>
+</html>
