@@ -7,6 +7,7 @@
 enum { STT_NONE = 0, STT_OPENAI_WHISPER = 1, STT_AZURE = 2 };
 enum { TTS_NONE = 0, TTS_OPENAI = 1, TTS_AZURE = 2 };
 enum { LLM_NONE = 0, LLM_OPENAI = 1 };
+enum { WAKE_NONE = 0, WAKE_CLOUD_VERIFY = 1, WAKE_LOCAL_WAKENET = 2 };
 
 // ---------- 语言与语音 ----------
 #define STORY_LANG "zh-CN"          // 故事语言
@@ -42,6 +43,20 @@ enum { LLM_NONE = 0, LLM_OPENAI = 1 };
 #define LLM_OPENAI_MODEL "gpt-4o-mini"
 #define LLM_MAX_TOKENS 400
 #define LLM_TEMPERATURE 0.8f
+
+// ---------- 语音唤醒 ----------
+#define WAKE_WORD "小可爱"           // 唤醒词
+// 可选值：WAKE_NONE（默认，只用按钮，不常听）、WAKE_CLOUD_VERIFY、WAKE_LOCAL_WAKENET
+// WAKE_CLOUD_VERIFY：麦克风常听，检测到声音后录 2 秒，发 STT 验证是否含唤醒词。
+//   优点：今天就能用，不用训练模型；缺点：唤醒有 1-2 秒延迟，验证片段会上传到 STT 服务。
+// WAKE_LOCAL_WAKENET：本地离线唤醒，见 firmware/README.md 的训练说明。
+//   需要先用 Espressif ESP-SR 训练“小可爱”的 WakeNet 模型并放入固件，
+//   未提供模型文件时自动回落到 WAKE_NONE，不会误报。
+#define WAKE_MODE WAKE_NONE
+#define WAKE_LISTEN_SECONDS 2       // 云端验证时每次录音时长
+#define WAKE_VAD_THRESHOLD 1500     // 唤醒触发阈值，比普通 VAD 高，减少误触发
+#define WAKE_AWAKE_TIMEOUT_MS 10000 // 唤醒后 10 秒内没说话，自动回到待机
+#define WAKE_COOLDOWN_MS 3000       // 一次唤醒后 3 秒内不再重复触发
 
 // ---------- 网络 ----------
 #define WIFI_TIMEOUT_MS 15000

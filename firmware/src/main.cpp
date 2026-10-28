@@ -1,4 +1,4 @@
-// 亲子 AI 故事机 · ESP32-S3 固件 v0.2
+// 亲子 AI 故事机 · ESP32-S3 固件 v0.3
 // 引脚配置见下表，不做改动。
 //   麦克风 INMP441 (I2S0 收): WS=GPIO4, SCK=GPIO5, SD=GPIO6, L/R=GND(左声道)
 //   功放 MAX98357A (I2S1 发): DIN=GPIO7, BCLK=GPIO15, LRC=GPIO16, SD=Vin常开, GAIN=GND
@@ -312,6 +312,75 @@ static size_t recordAudio(int16_t* out, size_t maxCount) {
   return count;
 }
 
+// ---------- 语音唤醒 ----------
+// 状态机：IDLE（待机，常听唤醒词）-> AWAKE（已唤醒，等指令，10 秒超时）-> IDLE
+// 唤醒词在 config.h 中配置，默认为不启用（WAKE_NONE），只用按钮。
+enum WakeState { WAKE_IDLE, WAKE_AWAKE };
+static WakeState wakeState = WAKE_IDLE;
+static unsigned long awakeUntil = 0;
+static unsigned long wakeCooldownUntil = 0;
+
+// 本地 WakeNet 集成点：把训练好的“小可爱”模型放进固件后，在这里调用 ESP-SR 的
+// wakenet 检测接口，返回 true 表示检测到唤醒词。未集成模型时返回 false。
+static bool wakenetDetect(const int16_t* /*samples*/, size_t /*count*/) {
+  // TODO：集成 ESP-SR WakeNet 模型后实现。模型训练见 firmware/README.md。
+  return false;
+}
+
+// 云端验证：录 WAKE_LISTEN_SECONDS 秒，发 STT，看识别结果是否含唤醒词
+static bool cloudVerifyWakeWord() {
+  if (STT_PROVIDER == STT_NONE || !wifiConnected) return false;
+  size_t maxCount = AUDIO_SAMPLE_RATE * WAKE_LISTEN_SECONDS;
+  int16_t* samples = (int16_t*)ps_malloc(maxCount * sizeof(int16_t));
+  if (!samples) return false;
+  size_t count = 0;
+  unsigned long start = millis();
+  int32_t raw[256]; size_t readBytes = 0;
+  while (count < maxCount && millis() - start < WAKE_LISTEN_SECONDS * 1000UL) {
+    if (i2s_read(I2S_NUM_0, raw, sizeof(raw), &readBytes, 100 / portTICK_PERIOD_MS) != ESP_OK) continue;
+    int n = readBytes / 4;
+    for (int i = 0; i < n && count < maxCount; i++) samples[count++] = (int16_t)(raw[i] >> 16);
+  }
+  String heard;
+  bool ok = count > 1000 && transcribeAudio(samples, count, heard) && heard.indexOf(WAKE_WORD) >= 0;
+  if (ok) Serial.printf("[唤醒] 听到唤醒词，识别结果：%s\n", heard.c_str());
+  free(samples);
+  return ok;
+}
+
+static bool checkWakeWord() {
+  if (WAKE_MODE == WAKE_NONE || millis() < wakeCooldownUntil) return false;
+  if (WAKE_MODE == WAKE_CLOUD_VERIFY) return cloudVerifyWakeWord();
+  if (WAKE_MODE == WAKE_LOCAL_WAKENET) {
+    // 本地模式：读一小段音频交给 WakeNet 检测
+    int16_t buf[1600]; int32_t raw[256]; size_t readBytes = 0; size_t count = 0;
+    while (count < 1600) {
+      if (i2s_read(I2S_NUM_0, raw, sizeof(raw), &readBytes, 100 / portTICK_PERIOD_MS) != ESP_OK) continue;
+      int n = readBytes / 4;
+      for (int i = 0; i < n && count < 1600; i++) buf[count++] = (int16_t)(raw[i] >> 16);
+    }
+    return wakenetDetect(buf, count);
+  }
+  return false;
+}
+
+static void onWake() {
+  wakeState = WAKE_AWAKE;
+  awakeUntil = millis() + WAKE_AWAKE_TIMEOUT_MS;
+  wakeCooldownUntil = millis() + WAKE_COOLDOWN_MS;
+  playTone(880, 120); playTone(1046, 180); // 唤醒提示音，和普通提示音不同
+  lcd.fillScreen(TFT_WHITE);
+  lcd.setTextColor(TFT_BLACK, TFT_WHITE);
+  lcd.setTextSize(2);
+  lcd.setCursor(8, 10);
+  lcd.println("我在听");
+  lcd.setTextSize(1);
+  lcd.setCursor(8, 40);
+  lcd.println("请说出你想要的故事，");
+  lcd.println("比如：讲一个小猫去太空的故事");
+  Serial.println("[唤醒] 已唤醒，等待指令，10 秒超时");
+}
+
 // ---------- LCD 显示 ----------
 static void showStory(int idx) {
   const Story& s = STORIES[idx];
@@ -335,17 +404,52 @@ static void showStory(int idx) {
   lcd.setTextSize(1);
   lcd.setTextColor(TFT_DARKGREY, TFT_WHITE);
   lcd.setCursor(8, 300);
-  lcd.println("按 BOOT 键 = 下一个故事");
+  if (WAKE_MODE != WAKE_NONE) lcd.println("说“小可爱”唤醒我 · 按 BOOT 键换故事");
+  else lcd.println("按 BOOT 键 = 下一个故事");
   Serial.printf("[故事] %s | %s | %s | %s\n", s.title, s.hero, s.scene, s.lesson);
   Serial.println(s.body);
+}
+
+// 语音指令流程（长按按钮和唤醒后共用）：录音 -> STT -> LLM 生成 -> TTS 播放
+// 任一步失败回落到本地故事
+static void processVoiceCommand() {
+  if (STT_PROVIDER == STT_NONE) {
+    Serial.println("[语音] STT 未启用（config.h 中 STT_PROVIDER=STT_NONE）");
+    showStory(storyIndex);
+    return;
+  }
+  size_t maxCount = AUDIO_SAMPLE_RATE * MAX_RECORD_SECONDS;
+  int16_t* samples = (int16_t*)ps_malloc(maxCount * sizeof(int16_t));
+  if (!samples) { showStory(storyIndex); return; }
+  size_t count = recordAudio(samples, maxCount);
+  Serial.printf("[语音] 录音 %u 个采样\n", (unsigned)count);
+  String heard;
+  if (count > 1000 && transcribeAudio(samples, count, heard)) {
+    Serial.printf("[STT] 听到：%s\n", heard.c_str());
+    String aiStory;
+    String prompt = "孩子说：" + heard + "。请根据这句话编一个睡前故事。";
+    if (generateStoryAI(prompt, aiStory)) {
+      Serial.println("[LLM] 已生成故事，正在用 TTS 播放");
+      if (!speakText(aiStory)) showStory(storyIndex);
+    } else {
+      Serial.println("[LLM] 生成失败，回落到本地故事");
+      showStory(storyIndex);
+    }
+  } else {
+    Serial.println("[STT] 识别失败，回落到本地故事");
+    showStory(storyIndex);
+  }
+  free(samples);
+  wakeState = WAKE_IDLE;
 }
 
 // ---------- setup / loop ----------
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n[故事机] 启动，H1-H5 v0.2");
-  Serial.printf("[配置] STT=%d TTS=%d LLM=%d 语言=%s\n", STT_PROVIDER, TTS_PROVIDER, LLM_PROVIDER, STORY_LANG);
+  Serial.println("\n[故事机] 启动，H1-H5 v0.3");
+  Serial.printf("[配置] STT=%d TTS=%d LLM=%d 唤醒=%d 唤醒词=%s 语言=%s\n", STT_PROVIDER, TTS_PROVIDER, LLM_PROVIDER, WAKE_MODE, WAKE_WORD, STORY_LANG);
+  if (WAKE_MODE != WAKE_NONE) Serial.println("[唤醒] 已启用，常听模式：只有检测到声音后才会录音验证");
 
   // 背光：先开
   pinMode(PIN_LCD_BLK, OUTPUT);
@@ -388,6 +492,7 @@ void setup() {
 void loop() {
   // H3: 麦克风电平，每 500ms 读一次，串口打印，确认麦克风有信号
   static unsigned long lastMic = 0;
+  static int lastMicLevel = 0;
   if (millis() - lastMic > 500) {
     lastMic = millis();
     int32_t buf[128];
@@ -396,13 +501,27 @@ void loop() {
       int n = readBytes / 4;
       long sum = 0;
       for (int i = 0; i < n; i++) sum += abs(buf[i] >> 8);
-      int level = n ? (int)(sum / n / 1000) : 0;
-      Serial.printf("[H3] Mic level=%d (对着麦克风说话，数字应该变大)\n", level);
+      lastMicLevel = n ? (int)(sum / n / 1000) : 0;
+      Serial.printf("[H3] Mic level=%d (对着麦克风说话，数字应该变大)\n", lastMicLevel);
+    }
+  }
+
+  // 语音唤醒：待机时检测到声音（电平 > 5，按串口 Mic level 的实际值调），验证唤醒词
+  if (WAKE_MODE != WAKE_NONE && wakeState == WAKE_IDLE && lastMicLevel > 5) {
+    if (checkWakeWord()) onWake();
+  }
+  // 已唤醒：10 秒超时回待机；检测到说话声，自动处理语音指令
+  if (wakeState == WAKE_AWAKE) {
+    if (millis() > awakeUntil) {
+      wakeState = WAKE_IDLE;
+      Serial.println("[唤醒] 超时，回到待机");
+      showStory(storyIndex);
+    } else if (lastMicLevel > 5) {
+      processVoiceCommand();
     }
   }
 
   // 按钮：短按（<800ms）= 下一个本地故事；长按（>=800ms）= 语音输入
-  // 长按流程：录音 -> STT -> LLM 生成故事 -> TTS 播放；任一步失败回落到本地故事
   static int lastBtn = HIGH;
   static unsigned long pressStart = 0;
   static bool longPressHandled = false;
@@ -410,34 +529,8 @@ void loop() {
   if (btn == LOW && lastBtn == HIGH) { pressStart = millis(); longPressHandled = false; }
   if (btn == LOW && !longPressHandled && millis() - pressStart >= 800) {
     longPressHandled = true;
-    if (STT_PROVIDER == STT_NONE) {
-      Serial.println("[语音] STT 未启用（config.h 中 STT_PROVIDER=STT_NONE），长按无效");
-    } else {
-      Serial.println("[语音] 开始录音，松开按钮结束（最长 8 秒）");
-      size_t maxCount = AUDIO_SAMPLE_RATE * MAX_RECORD_SECONDS;
-      int16_t* samples = (int16_t*)ps_malloc(maxCount * sizeof(int16_t));
-      if (samples) {
-        size_t count = recordAudio(samples, maxCount);
-        Serial.printf("[语音] 录音 %u 个采样\n", (unsigned)count);
-        String heard;
-        if (count > 1000 && transcribeAudio(samples, count, heard)) {
-          Serial.printf("[STT] 听到：%s\n", heard.c_str());
-          String aiStory;
-          String prompt = "孩子说：" + heard + "。请根据这句话编一个睡前故事。";
-          if (generateStoryAI(prompt, aiStory)) {
-            Serial.println("[LLM] 已生成故事，正在用 TTS 播放");
-            if (!speakText(aiStory)) { showStory(storyIndex); }
-          } else {
-            Serial.println("[LLM] 生成失败，回落到本地故事");
-            showStory(storyIndex);
-          }
-        } else {
-          Serial.println("[STT] 识别失败，回落到本地故事");
-          showStory(storyIndex);
-        }
-        free(samples);
-      }
-    }
+    Serial.println("[语音] 开始录音，松开按钮结束（最长 8 秒）");
+    processVoiceCommand();
   }
   if (btn == HIGH && lastBtn == LOW && !longPressHandled && millis() - pressStart < 800 && millis() - pressStart > 50) {
     storyIndex = (storyIndex + 1) % STORY_COUNT;
